@@ -484,6 +484,25 @@ def mask_api_base_credentials(api_base: str) -> str:
     return api_base[:key_end] + "*" * 5 + api_base[-4:]
 
 
+@lru_cache(maxsize=64)
+def warn_cost_tracking_failed(model: str, custom_llm_provider: str | None, error_str: str) -> None:
+    """
+    A model with no pricing entry records zero spend, so every budget, spend limit and
+    spend report silently excludes it. That has to be visible to an operator without
+    turning debug logging on. Deduplicated through ``lru_cache`` so an unpriced model
+    warns once per process rather than once per request.
+    """
+    verbose_logger.warning(
+        "Cost tracking failed for model=%s custom_llm_provider=%s, so this request "
+        "records 0.0 spend and budgets/spend limits do not apply to it. Add a pricing "
+        "entry to model_prices_and_context_window.json, or set input_cost_per_token / "
+        "output_cost_per_token on the deployment. Reason: %s",
+        model,
+        custom_llm_provider,
+        error_str,
+    )
+
+
 class Logging(LiteLLMLoggingBaseClass):
     global \
         supabaseClient, \
@@ -1851,6 +1870,11 @@ class Logging(LiteLLMLoggingBaseClass):
             )
             verbose_logger.debug("response_cost_failure_debug_information: %s", debug_info)
             self.model_call_details["response_cost_failure_debug_information"] = debug_info
+            warn_cost_tracking_failed(
+                model=debug_info.get("model", ""),
+                custom_llm_provider=debug_info.get("custom_llm_provider"),
+                error_str=debug_info["error_str"],
+            )
 
         return None
 

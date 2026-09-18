@@ -302,6 +302,110 @@ def test_response_cost_calculator_uses_router_model_id_from_litellm_metadata():
         litellm.model_cost.pop(custom_model_id, None)
 
 
+class TestUnpricedModelWarning:
+    """
+    A model with no pricing entry (a newly launched Bedrock model, say) makes cost
+    calculation raise, which ``_response_cost_calculator`` swallows. The request then
+    records 0.0 spend, so every budget and spend limit on the key silently stops
+    applying to that model. Only a debug log said so, which is off in production.
+    """
+
+    UNPRICED_MODEL: Final = "test-provider/model-with-no-pricing-entry"
+
+    @pytest.fixture(autouse=True)
+    def _reset_warning_dedupe(self):
+        from litellm.litellm_core_utils.litellm_logging import warn_cost_tracking_failed
+
+        warn_cost_tracking_failed.cache_clear()
+        yield
+        warn_cost_tracking_failed.cache_clear()
+
+    def _logging_obj(self, model: str) -> LitellmLogging:
+        logging_obj = LitellmLogging(
+            model=model,
+            messages=[{"role": "user", "content": "Hey"}],
+            stream=False,
+            call_type="completion",
+            start_time=time.time(),
+            litellm_call_id="unpriced-model-test",
+            function_id="unpriced-model-test",
+        )
+        logging_obj.update_environment_variables(
+            model=model,
+            user="",
+            optional_params={},
+            litellm_params={"api_base": ""},
+        )
+        return logging_obj
+
+    def _response(self, model: str) -> ModelResponse:
+        response = ModelResponse(model=model)
+        response.usage = litellm.Usage(prompt_tokens=1000, completion_tokens=500, total_tokens=1500)
+        return response
+
+    @contextlib.contextmanager
+    def _captured_warnings(self, caplog: pytest.LogCaptureFixture):
+        from litellm._logging import verbose_logger
+
+        verbose_logger.propagate = True
+        try:
+            with caplog.at_level("WARNING", logger="LiteLLM"):
+                yield
+        finally:
+            verbose_logger.propagate = False
+
+    @staticmethod
+    def _zero_spend_warnings(caplog: pytest.LogCaptureFixture, model: str) -> list[str]:
+        return [
+            message
+            for record in caplog.records
+            if record.levelname == "WARNING"
+            and model in (message := record.getMessage())
+            and "0.0 spend" in message
+        ]
+
+    def test_warns_that_spend_records_as_zero(self, caplog: pytest.LogCaptureFixture):
+        logging_obj = self._logging_obj(self.UNPRICED_MODEL)
+
+        with self._captured_warnings(caplog):
+            cost = logging_obj._response_cost_calculator(result=self._response(self.UNPRICED_MODEL))
+
+        assert cost is None
+        warnings = self._zero_spend_warnings(caplog, self.UNPRICED_MODEL)
+        assert len(warnings) == 1, caplog.text
+        assert "budgets" in warnings[0]
+
+    def test_warns_once_per_model_not_once_per_request(self, caplog: pytest.LogCaptureFixture):
+        with self._captured_warnings(caplog):
+            for _ in range(3):
+                self._logging_obj(self.UNPRICED_MODEL)._response_cost_calculator(
+                    result=self._response(self.UNPRICED_MODEL)
+                )
+
+        assert len(self._zero_spend_warnings(caplog, self.UNPRICED_MODEL)) == 1, caplog.text
+
+    def test_priced_model_costs_more_than_zero_and_does_not_warn(self, caplog: pytest.LogCaptureFixture):
+        priced_model = "test-provider/model-with-a-pricing-entry"
+        litellm.register_model(
+            model_cost={
+                priced_model: {
+                    "input_cost_per_token": 1e-06,
+                    "output_cost_per_token": 2e-06,
+                    "litellm_provider": "openai",
+                    "mode": "chat",
+                }
+            }
+        )
+        try:
+            with self._captured_warnings(caplog):
+                cost = self._logging_obj(priced_model)._response_cost_calculator(result=self._response(priced_model))
+        finally:
+            litellm.model_cost.pop(priced_model, None)
+
+        assert cost == pytest.approx(1000 * 1e-06 + 500 * 2e-06)
+        assert self._zero_spend_warnings(caplog, priced_model) == []
+
+
 class TestGetRouterModelId:
     """Tests for the get_router_model_id helper method."""
 
