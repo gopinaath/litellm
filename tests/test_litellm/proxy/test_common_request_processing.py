@@ -8,10 +8,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+import yaml
 from fastapi import HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.testclient import TestClient
 
 import litellm
+from litellm.caching.caching import DualCache
+from litellm.types.utils import CallTypesLiteral
 from litellm._uuid import uuid
 from litellm.constants import (
     CLIENT_REQUESTED_MODEL_SCOPE_KEY,
@@ -358,6 +362,77 @@ class TestProxyBaseLLMRequestProcessing:
         assert exc_info.value.code == str(status.HTTP_400_BAD_REQUEST)
         assert exc_info.value.param == "model"
         add_litellm_data_to_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "requested_messages",
+        ["this-should-be-an-array", {"role": "user", "content": "hi"}, ["hi"], [{"role": "user"}, "hi"], 1],
+    )
+    async def test_common_processing_pre_call_logic_rejects_malformed_messages_before_any_hook_runs(
+        self, monkeypatch, requested_messages: object
+    ):
+        """
+        A non-list ``messages`` (or a list holding non-objects) used to reach the pre-call
+        hooks, which index into every message, and blow up with an ``AttributeError``
+        traceback. It has to be rejected here, before any hook sees the body.
+        """
+        processing_obj = ProxyBaseLLMRequestProcessing(data={"model": "gpt-5.2", "messages": requested_messages})
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        add_litellm_data_to_request = AsyncMock()
+        monkeypatch.setattr(
+            litellm.proxy.common_request_processing, "add_litellm_data_to_request", add_litellm_data_to_request
+        )
+        mock_proxy_logging_obj = MagicMock(spec=ProxyLogging)
+        mock_proxy_logging_obj.pre_call_hook = AsyncMock()
+
+        with pytest.raises(ProxyException) as exc_info:
+            await processing_obj.common_processing_pre_call_logic(
+                request=mock_request,
+                general_settings={},
+                user_api_key_dict=MagicMock(spec=UserAPIKeyAuth),
+                proxy_logging_obj=mock_proxy_logging_obj,
+                proxy_config=MagicMock(spec=ProxyConfig),
+                route_type="acompletion",
+            )
+
+        assert exc_info.value.code == str(status.HTTP_400_BAD_REQUEST)
+        assert exc_info.value.param == "messages"
+        assert exc_info.value.type == ProxyErrorTypes.bad_request_error
+        assert _has_attribute_error_in_chain(exc_info.value) is False
+        add_litellm_data_to_request.assert_not_awaited()
+        mock_proxy_logging_obj.pre_call_hook.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "requested_messages",
+        [[], [{"role": "user", "content": "hi"}], [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]],
+    )
+    async def test_common_processing_pre_call_logic_accepts_well_formed_messages(
+        self, monkeypatch, requested_messages: list[dict[str, object]]
+    ):
+        processing_obj = ProxyBaseLLMRequestProcessing(data={"model": "gpt-5.2", "messages": requested_messages})
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        monkeypatch.setattr(
+            litellm.proxy.common_request_processing,
+            "add_litellm_data_to_request",
+            AsyncMock(side_effect=lambda data, **kwargs: data),
+        )
+        mock_proxy_logging_obj = MagicMock(spec=ProxyLogging)
+        mock_proxy_logging_obj.pre_call_hook = AsyncMock(side_effect=lambda data, **kwargs: data)
+
+        returned_data, _ = await processing_obj.common_processing_pre_call_logic(
+            request=mock_request,
+            general_settings={},
+            user_api_key_dict=ProxyUserAPIKeyAuth(api_key="sk-test"),
+            proxy_logging_obj=mock_proxy_logging_obj,
+            proxy_config=MagicMock(spec=ProxyConfig),
+            route_type="acompletion",
+        )
+
+        assert returned_data["messages"] == requested_messages
+        mock_proxy_logging_obj.pre_call_hook.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_common_processing_pre_call_logic_refreshes_proxy_server_request_body_after_guardrails(
@@ -1872,6 +1947,81 @@ class TestProxyBaseLLMRequestProcessing:
         assert arrival_time + metadata["queue_time_seconds"] == pytest.approx(
             logging_obj.start_time.timestamp(), abs=1e-6
         )
+
+
+class _MessagesIndexingPreCallHook(CustomLogger):
+    """
+    Stand-in for the real pre-call hooks that read ``messages`` (enterprise managed
+    files, guardrails, prompt templates): it indexes into each message exactly the way
+    they do, so a malformed body reaching it raises ``AttributeError``, not a 400.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.saw_request = False
+
+    async def async_pre_call_hook(
+        self,
+        user_api_key_dict: ProxyUserAPIKeyAuth,
+        cache: DualCache,
+        data: dict,
+        call_type: CallTypesLiteral,
+    ) -> dict:
+        self.saw_request = True
+        for message in data.get("messages") or []:
+            message.get("role")
+        return data
+
+
+def test_chat_completions_rejects_a_non_list_messages_without_an_attribute_error(
+    tmp_path, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    ``{"messages": "a string"}`` used to reach the pre-call hooks and 400 by way of an
+    ``AttributeError``, dumping a full traceback into the proxy log. It has to come back
+    as a plain validation error naming ``messages``, with the hooks never invoked.
+    """
+    from litellm._logging import verbose_proxy_logger
+    from litellm.proxy.proxy_server import app, cleanup_router_config_variables, initialize
+
+    cleanup_router_config_variables()
+    config_fp: Final = tmp_path / "proxy_config.yaml"
+    config_fp.write_text(
+        yaml.safe_dump(
+            {
+                "general_settings": {"master_key": "sk-1234"},
+                "model_list": [
+                    {
+                        "model_name": "fake-model",
+                        "litellm_params": {"model": "openai/fake-model", "api_key": "sk-fake"},
+                    }
+                ],
+            }
+        )
+    )
+    asyncio.run(initialize(config=str(config_fp)))
+
+    hook: Final = _MessagesIndexingPreCallHook()
+    monkeypatch.setattr(litellm, "callbacks", [hook])
+    verbose_proxy_logger.propagate = True
+    try:
+        with caplog.at_level("ERROR", logger="LiteLLM Proxy"):
+            response: Final = TestClient(app).post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer sk-1234"},
+                json={"model": "fake-model", "messages": "this-should-be-an-array"},
+            )
+    finally:
+        verbose_proxy_logger.propagate = False
+
+    assert response.status_code == 400, response.text
+    assert "AttributeError" not in caplog.text
+    assert "has no attribute" not in caplog.text
+    assert hook.saw_request is False
+    error: Final = response.json()["error"]
+    assert error["param"] == "messages"
+    assert error["type"] == ProxyErrorTypes.bad_request_error.value
+    assert "has no attribute" not in error["message"]
 
 
 @pytest.mark.asyncio

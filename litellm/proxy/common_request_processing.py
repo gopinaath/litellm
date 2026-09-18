@@ -675,6 +675,16 @@ def _request_model(data: Mapping[str, object]) -> str | list[str] | None:
         return None
 
 
+def _is_message_list(messages: object) -> bool:
+    """
+    Every consumer downstream of this boundary (pre-call hooks, guardrails, managed
+    files, prompt factories) reads ``messages`` as a list of dicts, so a scalar or a
+    list of scalars surfaces as an ``AttributeError`` traceback instead of a validation
+    error. Deliberately shallow: message *contents* stay as permissive as ever.
+    """
+    return isinstance(messages, list) and all(isinstance(message, dict) for message in messages)
+
+
 async def _enforce_guardrail_added_tag_budgets(
     data: Mapping[str, object],
     tags_before_guardrails: frozenset[str],
@@ -1944,6 +1954,14 @@ class ProxyBaseLLMRequestProcessing:
                 message="'model' must be a string.",
                 type=ProxyErrorTypes.bad_request_error,
                 param="model",
+                code=status.HTTP_400_BAD_REQUEST,
+            )
+        requested_messages: Final = self.data.get("messages")
+        if requested_messages is not None and not _is_message_list(requested_messages):
+            raise ProxyException(
+                message="'messages' must be a list of message objects.",
+                type=ProxyErrorTypes.bad_request_error,
+                param="messages",
                 code=status.HTTP_400_BAD_REQUEST,
             )
         self.data = await add_litellm_data_to_request(
